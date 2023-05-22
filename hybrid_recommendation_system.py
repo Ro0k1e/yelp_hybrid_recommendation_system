@@ -10,6 +10,8 @@ Error Distribution:
 >=3 and <4: 790
 >=4: 0
 
+RMSE: 0.975
+
 Esecution Time:
 around 600 seconds
 """
