@@ -1,193 +1,494 @@
-import sys
-import math
-from time import time
+"""
+A recommendation system built based on yelp's dataset.
+Used PCA to reduce dimensionality and kept top 10 principal components as features.
+Implemented a feature-agumented CF and add the result of it as a feature to the model-based CF.
+
+Error Distribution:
+>=0 and <1: 105773
+>=1 and <2: 34123
+>=2 and <3: 6310
+>=3 and <4: 790
+>=4: 0
+
+Esecution Time:
+around 600 seconds
+"""
 import json
-import xgboost
+import sys
+import time
+from datetime import datetime
+from itertools import chain
 import numpy as np
-from pyspark import SparkContext
+import pandas as pd
+from pyspark import SparkContext, SparkConf
+from sklearn.decomposition import PCA
+from sklearn.model_selection import train_test_split
+
+# read rows
+def read_train(x):
+    row_list = x.split(",")
+    return row_list[1], row_list[0], row_list[2]
 
 
-def get_average(score_list):
-    sum = 0.0
-    for x in score_list:
-        sum += float(x[1])
-    return sum / len(score_list)
+def read_test(x):
+    row_list = x.split(",")
+    return row_list[1], row_list[0]
 
+def get_RMSE(test_path):
+    # calculate RMSE
+    with open("competition.csv") as in_file:
+        guess = in_file.readlines()[1:]
+    with open(test_path.replace("_in", "")) as in_file:
+        ans = in_file.readlines()[1:]
+    res = {"<1": 0, "1~2": 0, "2~3": 0, "3~4": 0, "4~5": 0}
+    dist_guess = {"<1": 0, "1~2": 0, "2~3": 0, "3~4": 0, "4~5": 0}
+    dist_ans = {"1": 0, "2": 0, "3": 0, "4": 0, "5": 0}
+    large_small = {"large": 0, "small": 0}
 
-def get_pearson(bid1, bid2):
-    co_rated_users = list(set(bid1.keys()) & set(bid2.keys()))
-
-    co_rated_user_score_in_1 = [float(bid1[user]) for user in co_rated_users]
-    avg_1 = sum(co_rated_user_score_in_1) / len(co_rated_user_score_in_1)
-    nomralized_1 = [(i - avg_1) for i in co_rated_user_score_in_1]
-
-    co_rated_user_score_in_2 = [float(bid2[user]) for user in co_rated_users]
-    avg_2 = sum(co_rated_user_score_in_2) / len(co_rated_user_score_in_2)
-    nomralized_2 = [(i - avg_2)for i in co_rated_user_score_in_2]
-
-    # since the co_rated_users are already filtered out, it is guaranteed that len(nomralized_1) = len(nomralized_2)
-    numerator = sum([nomralized_1[i] * nomralized_2[i] for i in range(len(nomralized_1))])
-    sqrt_1 = math.sqrt(sum([math.pow(nomralized_1[i],2) for i in range(len(nomralized_1))]))
-    sqrt_2 = math.sqrt(sum([math.pow(nomralized_2[i],2) for i in range(len(nomralized_2))]))
-    if sqrt_1 * sqrt_2 == 0:
-        return 0
-    else:
-        return numerator / (sqrt_1 * sqrt_2)
-
-
-def predict(test_train_score, business_pairs_dict, business_avg_score):
-    business_to_predict = test_train_score[0]
-    neighbors_score_list = list(test_train_score[1])
-    score_weight_list = []
-    for business_score in neighbors_score_list:
-        key = (business_score[0], business_to_predict)
-        score_weight_list.append((float(business_score[1]), business_pairs_dict.get(key, 0)))
-    top_50_score_list = sorted(score_weight_list, key=lambda score_weight: score_weight[1], reverse=True)[:50]
-    numerator = 0.0
-    denominator = 0.0
-    for score_weight in top_50_score_list:
-        numerator += (score_weight[0] * score_weight[1])
-        denominator += abs(score_weight[1])
-    if denominator * numerator == 0:
-        return [business_to_predict, business_avg_score.get(business_to_predict), len(neighbors_score_list)]
-    return [business_to_predict, numerator / denominator, len(neighbors_score_list)]
-
-
-def collaborative_filtering(pre_train_data, pre_test_data):
-    user_idx_dict = pre_train_data.map(lambda x: x[0]).distinct().sortBy(lambda x: x).zipWithIndex().collectAsMap()
-    business_idx_dict = pre_train_data.map(lambda x: x[1]).distinct().sortBy(lambda x: x).zipWithIndex().collectAsMap()
-    idx_user_dict = {idx: user for user, idx in user_idx_dict.items()}
-    idx_business_dict = {idx: business for business, idx in business_idx_dict.items()}
-
-    business_user_rdd = pre_train_data.map(lambda x: (business_idx_dict[x[1]], (user_idx_dict[x[0]], x[2]))) \
-        .groupByKey().mapValues(list)
-    user_business_score_rdd = pre_train_data.map(lambda x: (user_idx_dict[x[0]], (business_idx_dict[x[1]], x[2]))) \
-        .groupByKey().mapValues(list)
-
-    business_user_score = business_user_rdd.collectAsMap()
-    user_business_score = user_business_score_rdd.collectAsMap()
-    business_avg_score = business_user_rdd.map(lambda x: (x[0], get_average(x[1]))).collectAsMap()
-    user_avg_score = user_business_score_rdd.map(lambda x: (x[0], get_average(x[1]))).collectAsMap()
-
-    test_user_business_rdd = pre_test_data.map(lambda x: (user_idx_dict.get(x[0], -1), business_idx_dict.get(x[1], -1))) \
-        .filter(lambda x: x[0] != -1 and x[1] != -1)
-
-    filtered_pairs = pre_test_data.filter(
-        lambda pair: pair[0] not in user_idx_dict.keys() or pair[1] not in business_idx_dict.keys()).collect()
-    print(('7fZu8ud7JXFthU0jPxVf4g', 'yFumR3CWzpfvTH2FCthvVw') in filtered_pairs)
-    print(('7fZu8ud7JXFthU0jPxVf4g', 'yFumR3CWzpfvTH2FCthvVw') in pre_test_data.collect())
-    joined_rdd = test_user_business_rdd.leftOuterJoin(user_business_score_rdd)
-    candidate_pairs = joined_rdd.flatMap(lambda x: [(bus_score[0], x[1][0]) for bus_score in x[1][1]])
-
-    business_pairs_dict = candidate_pairs \
-        .filter(lambda pair: len(
-        set(dict(business_user_score.get(pair[0])).keys()) & set(dict(business_user_score.get(pair[1])).keys())) >= 200) \
-        .map(lambda pair: (
-    pair, get_pearson(dict(business_user_score.get(pair[0])), dict(business_user_score.get(pair[1]))))) \
-        .filter(lambda pair: pair[1] > 0).map(lambda pair: {(pair[0][0], pair[0][1]): pair[1]}) \
-        .flatMap(lambda pair: pair.items()).collectAsMap()
-
-    predict_res = joined_rdd.map(lambda x: (x[0], predict(x[1], business_pairs_dict, business_avg_score)))
-    final_res = predict_res.map(
-        lambda pair: ((idx_user_dict[pair[0]], idx_business_dict[pair[1][0]]), pair[1][1])).collect()
-    predict_val_neighbor_num = predict_res.map(
-        lambda pair: ((idx_user_dict[pair[0]], idx_business_dict[pair[1][0]]), pair[1][2])).collectAsMap()
-    for pair in filtered_pairs:
-        if pair[0] in user_idx_dict.keys():
-            final_res.append((tuple(pair), user_avg_score[user_idx_dict[pair[0]]]))
-            predict_val_neighbor_num[tuple(pair)] = len(user_business_score[user_idx_dict[pair[0]]])
-        elif pair[1] in business_idx_dict.keys():
-            final_res.append((tuple(pair), business_avg_score[business_idx_dict[pair[0]]]))
-            predict_val_neighbor_num[tuple(pair)] = 0
+    RMSE = 0
+    for i in range(len(guess)):
+        diff = float(guess[i].split(",")[2]) - float(ans[i].split(",")[2])
+        RMSE += diff ** 2
+        if abs(diff) < 1:
+            res["<1"] = res["<1"] + 1
+        elif 2 > abs(diff) >= 1:
+            res["1~2"] = res["1~2"] + 1
+        elif 3 > abs(diff) >= 2:
+            res["2~3"] = res["2~3"] + 1
+        elif 4 > abs(diff) >= 3:
+            res["3~4"] = res["3~4"] + 1
         else:
-            final_res.append((tuple(pair), 2.5))
-            predict_val_neighbor_num[tuple(pair)] = 0
-    return final_res, predict_val_neighbor_num
+            res["4~5"] = res["4~5"] + 1
+    RMSE = (RMSE / len(guess)) ** (1 / 2)
+    print("RMSE: " + str(RMSE))
+    prediction = np.array([float(gg.split(',')[2]) for gg in guess])
+    print("Prediction mean: " + str(prediction.mean()))
+    print("Prediction std:" + str(prediction.std()))
+    ground = np.array([float(gg.split(',')[2]) for gg in ans])
+    print("Answer mean: " + str(ground.mean()))
+    print("Answer std: " + str(ground.std()))
 
 
-def model_based(pre_train_data, pre_test_data, user_feature_file, business_feature_file):
-    user_to_train = set(pre_train_data.map(lambda x: x[0]).distinct().collect())
-    business_to_train = set(pre_train_data.map(lambda x: x[1]).distinct().collect())
+# Item-Based CF
+def item_based_cf(uid_bid, sim_dict):
+    if uid_bid[1] not in train_RDD_uid:
+        return uid_dict_reversed[uid_bid[1]] + "," + bid_dict_reversed[uid_bid[0]] + "," + str(3.75) + "\n"
+    # find other items that the user have rated
+    # rated: uid [(bid, stars), ...]
+    rated = train_RDD_uid[uid_bid[1]]
+    # when no other users have rated this items: use user's average rating
+    if uid_bid[0] not in train_RDD_bid:
+        ratings = [xx[1] for xx in rated]
+        user_avg = sum(ratings)/len(ratings)
+        return uid_dict_reversed[uid_bid[1]] + "," + bid_dict_reversed[uid_bid[0]] + "," + str(user_avg) + "\n"
+    # to_rate: item to be rated
+    # to_rate: {uid: stars-mean, ...}
+    to_rate = train_RDD_bid[uid_bid[0]]
+    to_rate_set = set(to_rate.keys())
+    # calculate prediction
+    sim_list = []
+    rating_list = []
+    # rated: uid [(bid, stars), ...]
+    for rr in rated:
+        neighbor = train_RDD_bid[rr[0]]
+        intersect = set(neighbor.keys()).intersection(to_rate_set)
+        if len(intersect) < 3:
+            continue
+        # first look up the dictionary of similarities
+        pair = tuple(sorted([rr[0], uid_bid[0]]))
+        if pair in sim_dict:
+            sim = sim_dict[pair]
+            sim_list.append(sim)
+            rating_list.append(rr[1])
+        else:
+            sim_den = ((sum([to_rate[ii]**2 for ii in intersect])**(1/2))*(sum([neighbor[ii]**2 for ii in intersect])**(1/2)))
+            if sim_den == 0:
+                sim_dict[pair] = 0
+                continue
+            sim = sum([to_rate[ii] * neighbor[ii] for ii in intersect]) / sim_den
+            if sim < 0:
+                sim = sim + abs(sim) * 0.9
+            else:
+                sim = sim * 1.1
+            sim_dict[pair] = sim
+            sim_list.append(sim)
+            rating_list.append(rr[1])
+    # when there's no similar items: use business average
+    if sim_list == []:
+        other_users = list(train_RDD_bid_origin[uid_bid[0]].values())
+        bid_avg = sum(other_users)/len(other_users)
+        return uid_dict_reversed[uid_bid[1]] + "," + bid_dict_reversed[uid_bid[0]] + "," + str(bid_avg) + "\n"
+    elif len(sim_list) >= 5:
+        #use the X most similar items
+        sim_rating = sorted(tuple(zip(sim_list, rating_list)), key=lambda x: x[0])[0:5]
+        den = sum([abs(x[0]) for x in sim_rating])
+        num = sum([x[0] * x[1] for x in sim_rating])
+        if num <= 25:
+            other_users = list(train_RDD_bid_origin[uid_bid[0]].values())
+            bid_avg = sum(other_users) / len(other_users)
+            return uid_dict_reversed[uid_bid[1]] + "," + bid_dict_reversed[uid_bid[0]] + "," + str(bid_avg) + "\n"
+        else:
+            prediction = num / den
+            return uid_dict_reversed[uid_bid[1]] + "," + bid_dict_reversed[uid_bid[0]] + "," + str(prediction) + "\n"
+    else:
+        # less than three similar items: use business average
+        other_users = list(train_RDD_bid_origin[uid_bid[0]].values())
+        bid_avg = sum(other_users) / len(other_users)
+        return uid_dict_reversed[uid_bid[1]] + "," + bid_dict_reversed[uid_bid[0]] + "," + str(bid_avg) + "\n"
 
-    user_feature_map = sc.textFile(user_feature_file).map(lambda x: json.loads(x)) \
-        .filter(lambda x: x['user_id'] in user_to_train) \
-        .map(lambda x: (x['user_id'], [x['review_count'], x['average_stars']])) \
-        .collectAsMap()
 
-    business_feature_map = sc.textFile(business_feature_file).map(lambda x: json.loads(x)) \
-        .filter(lambda x: x['business_id'] in business_to_train) \
-        .map(lambda x: (x['business_id'], [x['review_count'], x['stars']])) \
-        .collectAsMap()
+def item_based(uid_bid, sim_dict):
+    """
+    :param uid_bid: bid, uid
+    :param sim_dict:
+    :return: uid_bid, prediction
+    """
+    # if user hasn't rated anything: use business average
+    # if business hasn't been rated by anyone, use 3.75
+    if uid_bid[1] not in train_RDD_uid:
+        if uid_bid[0] in train_RDD_bid_origin:
+            other_users = list(train_RDD_bid_origin[uid_bid[0]].values())
+            bid_avg = sum(other_users) / len(other_users)
+            return uid_bid, bid_avg
+        else:
+            return uid_bid, 3.75
+    # find other items that the user have rated
+    # rated: uid [(bid, stars), ...]
+    # rated: uid {bid, stars, ...}
+    rated = train_RDD_uid[uid_bid[1]]
+    # when no other users have rated this items: use user's average rating
+    if uid_bid[0] not in train_RDD_bid:
+        ratings = [rated[key] for key in rated]
+        user_avg = sum(ratings)/len(ratings)
+        return uid_bid, user_avg
+    # to_rate: item to be rated
+    # to_rate: {uid: stars-mean, ...}
+    to_rate = train_RDD_bid[uid_bid[0]]
+    to_rate_set = set(to_rate.keys())
+    # calculate prediction
+    sim_list = []
+    rating_list = []
+    # rated: uid [(bid, stars), ...]
+    # rated: uid {bid, stars, ...}
+    for key in rated:
+        rr = (key, rated[key]) # new line
+        neighbor = train_RDD_bid[rr[0]]
+        intersect = set(neighbor.keys()).intersection(to_rate_set)
+        if len(intersect) < 3:
+            continue
+        # first look up the dictionary of similarities
+        pair = tuple(sorted([rr[0], uid_bid[0]]))
+        if pair in sim_dict:
+            sim = sim_dict[pair]
+            sim_list.append(sim)
+            rating_list.append(rr[1])
+        else:
+            sim_den = ((sum([to_rate[ii]**2 for ii in intersect])**(1/2))*(sum([neighbor[ii]**2 for ii in intersect])**(1/2)))
+            if sim_den == 0:
+                sim_dict[pair] = 0
+                continue
+            sim = sum([to_rate[ii] * neighbor[ii] for ii in intersect]) / sim_den
+            if sim < 0:
+                sim = sim + abs(sim) * 0.9
+            else:
+                sim = sim * 1.1
+            sim_dict[pair] = sim
+            sim_list.append(sim)
+            rating_list.append(rr[1])
+    # when there's no similar items: use business average
+    if sim_list == []:
+        other_users = list(train_RDD_bid_origin[uid_bid[0]].values())
+        bid_avg = sum(other_users)/len(other_users)
+        return uid_bid, bid_avg
+    elif len(sim_list) >= 5:
+        #use the X most similar items
+        sim_rating = sorted(tuple(zip(sim_list, rating_list)), key=lambda x: x[0])[0:5]
+        den = sum([abs(x[0]) for x in sim_rating])
+        num = sum([x[0] * x[1] for x in sim_rating])
+        if num <= 25:
+            other_users = list(train_RDD_bid_origin[uid_bid[0]].values())
+            bid_avg = sum(other_users) / len(other_users)
+            return uid_bid, bid_avg
+        else:
+            prediction = num / den
+            return uid_bid, prediction
+    else:
+        # less than five similar items: use business average
+        other_users = list(train_RDD_bid_origin[uid_bid[0]].values())
+        bid_avg = sum(other_users) / len(other_users)
+        return uid_bid, bid_avg
 
-    train_x = np.array(pre_train_data.map(
-        lambda x: np.array([user_feature_map[x[0]], business_feature_map[x[1]]]).flatten()).collect())
-    train_y = np.array(pre_train_data.map(lambda x: float(x[2])).collect())
-    test_x = np.array(pre_test_data.map(lambda x: np.array(
-        [user_feature_map.get(x[0], [0, 2.5]), business_feature_map.get(x[1], [0, 2.5])]).flatten()).collect())
+def deduct_mean(value_tuple):
+    """
+    deduct mean for each item
+    :param x:
+    :return:
+    """
+    mean = sum([i[1] for i in value_tuple[1]]) / len(value_tuple[1])
+    output = [(i[0], i[1] - mean) for i in value_tuple[1]]
+    return value_tuple[0], dict([(i[0], i[1]) for i in value_tuple[1]]), dict(output)
 
-    model = xgboost.XGBRegressor(max_depth=10,
-                                 learning_rate=0.1,
-                                 n_estimators=100,
-                                 objective='reg:linear',
-                                 booster='gbtree',
-                                 gamma=0,
-                                 min_child_weight=1,
-                                 subsample=1,
-                                 colsample_bytree=1,
-                                 reg_alpha=0,
-                                 reg_lambda=1,
-                                 random_state=0)
+# Model-Based CF
+def get_matrix_train(x, user_frame, business_frame):
+    if x[1][0] in user_frame.index and x[0] in business_frame.index:
+        return list(user_frame.loc[x[1][0]]) + list(business_frame.loc[x[0]]) + [res_item_train[(x[0], x[1][0])]]
+    elif x[1][0] in user_frame.index and x[0] not in business_frame.index:
+        return list(user_frame.loc[x[1][0]]) + [np.nan] * business_frame.shape[1] + [res_item_train[(x[0], x[1][0])]]
+    elif x[1][0] not in user_frame.index and x[0] in business_frame.index:
+        return [np.nan] * user_frame.shape[1] + list(business_frame.loc[x[0]]) + [res_item_train[(x[0], x[1][0])]]
+    else:
+        return [np.nan] * user_frame.shape[1] + [np.nan] * business_frame.shape[1] + [res_item_train[(x[0], x[1][0])]]
 
-    model.fit(train_x, train_y)
-    predicted_value = model.predict(test_x)
+def get_matrix_test(x, user_frame, business_frame):
+    if x[1] in user_frame.index and x[0] in business_frame.index:
+        return list(user_frame.loc[x[1]]) + list(business_frame.loc[x[0]]) + [res_item_test[x]]
+    elif x[1] in user_frame.index and x[0] not in business_frame.index:
+        return list(user_frame.loc[x[1]]) + [np.nan] * business_frame.shape[1] + [res_item_test[x]]
+    elif x[1] not in user_frame.index and x[0] in business_frame.index:
+        return [np.nan] * user_frame.shape[1] + list(business_frame.loc[x[0]]) + [res_item_test[x]]
+    else:
+        return [np.nan] * user_frame.shape[1] + [np.nan] * business_frame.shape[1] + [res_item_test[x]]
 
-    res = []
-    for pair in zip(pre_test_data.collect(), predicted_value):
-        res.append(((pair[0][0], pair[0][1]), pair[1]))
-    return res
+def get_y(x):
+    return x[1][1]
+
+def read_business(x):
+    return x["business_id"], x["stars"], x["review_count"], x["state"], x["categories"], x["city"], x["latitude"], x["longitude"], x["hours"]
+
+def read_user(x):
+    return x["user_id"], x["average_stars"], x["review_count"], x["fans"], x["friends"], x["yelping_since"], x["useful"], x["funny"], x["cool"], x["compliment_hot"], x["compliment_more"], x["compliment_profile"], x["compliment_cute"], x["compliment_list"], x["compliment_note"], x["compliment_plain"], x["compliment_cool"], x["compliment_funny"], x["compliment_writer"], x["compliment_photos"]
+
+def map_business(x):
+    if x[4]:
+        if x[8]:
+            return bid_dict[x[0]], float(x[1]), int(x[2]), x[3], set(x[4].split(", ")), x[5], float(x[6]), float(x[7]), set(x[8].keys())
+        else:
+            return bid_dict[x[0]], float(x[1]), int(x[2]), x[3], set(x[4].split(", ")), x[5], float(x[6]), float(x[7]), set()
+    else:
+        if x[8]:
+            return bid_dict[x[0]], float(x[1]), int(x[2]), x[3], set(), x[5], float(x[6]), float(x[7]), set(x[8].keys())
+        else:
+            return bid_dict[x[0]], float(x[1]), int(x[2]), x[3], set(), x[5], float(x[6]), float(x[7]), set()
+
+def map_user(x):
+    if x[4] != "None":
+        return uid_dict[x[0]], float(x[1]), int(x[2]), int(x[3])**2, len(x[4].split(","))**2, (datetime.now() - datetime.strptime(x[5], "%Y-%m-%d")).days, int(x[6]), int(x[7]), int(x[8]), int(x[9]), int(x[10]), int(x[11]), int(x[12]), int(x[13]), int(x[14]), int(x[15]), int(x[16]), int(x[17]), int(x[18]), int(x[19])
+    else:
+        return uid_dict[x[0]], float(x[1]), int(x[2]), int(x[3])**2, 0, (datetime.now() - datetime.strptime(x[5], "%Y-%m-%d")).days, int(x[6]), int(x[7]), int(x[8]), int(x[9]), int(x[10]), int(x[11]), int(x[12]), int(x[13]), int(x[14]), int(x[15]), int(x[16]), int(x[17]), int(x[18]), int(x[19])
+
+if __name__ == """__main__""":
+    # parse command line arguments
+    folder_path = sys.argv[1]
+    test_path = sys.argv[2]
+    output_path = sys.argv[3]
+    
+    start_time = time.time()
+    sc = SparkContext()
+    sc.setLogLevel("ERROR")
+    # read data
+    if 1 == 1:
+        # train_RDD: (business_id, user_id, stars)
+        # test_RDD: (business_id, user_id)
+        train_RDD = sc.textFile(folder_path+"yelp_train.csv").filter(lambda x: not x.startswith("user_id")).map(
+            read_train)
+        test_RDD = sc.textFile(test_path).filter(lambda x: not x.startswith("user_id")).map(
+            read_test)
+        # get dictionary of business_id
+        bid_dict_train = set(train_RDD.map(lambda x: x[0]).distinct().collect())
+        bid_dict_test = set(test_RDD.map(lambda x: x[0]).distinct().collect())
+        bid_dict = bid_dict_train.union(bid_dict_test)
+        bid_dict = dict(zip(bid_dict, range(len(bid_dict))))
+        bid_dict_reversed = dict(zip(range(len(bid_dict)), bid_dict))
+        # get dictionary of user_id
+        uid_dict_train = set(train_RDD.map(lambda x: x[1]).distinct().collect())
+        uid_dict_test = set(test_RDD.map(lambda x: x[1]).distinct().collect())
+        uid_dict = uid_dict_train.union(uid_dict_test)
+        uid_dict = dict(zip(uid_dict, range(len(uid_dict))))
+        uid_dict_reversed = dict(zip(range(len(uid_dict)), uid_dict))
+        # use dictionaries to save space
+        train_RDD = train_RDD.map(lambda x: (bid_dict[x[0]], (uid_dict[x[1]], int(x[2][0])))).cache()
+        test_RDD = test_RDD.map(lambda x: (bid_dict[x[0]], uid_dict[x[1]])).cache()
+        # train_RDD_bid: bid, {uid: stars-mean, ...}. for a bid, see who have rated this item and what's the rating
+        # train_RDD_bid_origin: bid, {uid: stars, ...}. for a bid, see who have rated this item and what's the rating
+        train_RDD_bid_ = train_RDD.groupByKey().map(lambda x: (x[0], list(x[1]))).map(deduct_mean).collect()
+        train_RDD_bid = dict(zip([xx[0] for xx in train_RDD_bid_], [xx[2] for xx in train_RDD_bid_]))
+        train_RDD_bid_origin = dict(zip([xx[0] for xx in train_RDD_bid_], [xx[1] for xx in train_RDD_bid_]))
+        # train_RDD_uid: uid, [(bid, stars), ...] for a uid, see what items s/he have rated
+        # train_RDD_uid: uid, {bid: stars, ...} for a uid, see what items s/he have rated
+        # train_RDD_uid = train_RDD.map(lambda x: (x[1][0], (x[0], x[1][1]))).groupByKey().map(lambda x: (x[0], list(x[1]))).collect()
+        train_RDD_uid = train_RDD.map(lambda x: (x[1][0], (x[0], x[1][1]))).groupByKey().map(lambda x: (x[0], list(x[1]))).map(
+            lambda x: (x[0], dict(zip([xx[0] for xx in x[1]], [xx[1] for xx in x[1]])))).collect()
+        train_RDD_uid = dict(zip([xx[0] for xx in train_RDD_uid], [xx[1] for xx in train_RDD_uid]))
+    bool_dict = {"True": 1, "False": 0}
+    noise_dict = {"quiet": 1, "average": 2, "loud": 3, "very_loud": 4}
+    
+    # Item-Based CF
+    # calculate predictions
+    sim_dict = {}
+    res_item_test = dict()
+    res_item_train = dict()
+    for pair in test_RDD.collect():
+        uid_bid, prediction = item_based(pair, sim_dict)
+        res_item_test[uid_bid] = prediction
+    # pair: bid, uid
+    for pair in train_RDD.map(lambda x: (x[0], x[1][0])).collect():
+        stars_train_RDD_uid = train_RDD_uid[pair[1]].pop(pair[0])
+        if train_RDD_uid[pair[1]] == dict():
+            train_RDD_uid.pop(pair[1])
+
+        stars_mean_train_RDD_bid = train_RDD_bid[pair[0]].pop(pair[1])
+        if train_RDD_bid[pair[0]] == dict():
+            train_RDD_bid.pop(pair[0])
+
+        stars_train_RDD_bid_origin = train_RDD_bid_origin[pair[0]].pop(pair[1])
+        if train_RDD_bid_origin[pair[0]] == dict():
+            train_RDD_bid_origin.pop(pair[0])
+
+        uid_bid, prediction = item_based(pair, sim_dict)
+        res_item_train[uid_bid] = prediction
+
+        if pair[1] not in train_RDD_uid:
+            train_RDD_uid[pair[1]] = dict()
+            train_RDD_uid[pair[1]][pair[0]] = stars_train_RDD_uid
+        else:
+            train_RDD_uid[pair[1]][pair[0]] = stars_train_RDD_uid
+
+        if pair[0] not in train_RDD_bid:
+            train_RDD_bid[pair[0]] = dict()
+            train_RDD_bid[pair[0]][pair[1]] = stars_mean_train_RDD_bid
+        else:
+            train_RDD_bid[pair[0]][pair[1]] = stars_mean_train_RDD_bid
+
+        if pair[0] not in train_RDD_bid_origin:
+            train_RDD_bid_origin[pair[0]] = dict()
+            train_RDD_bid_origin[pair[0]][pair[1]] = stars_train_RDD_bid_origin
+        else:
+            train_RDD_bid_origin[pair[0]][pair[1]] = stars_train_RDD_bid_origin
+    print("Finished Item-based prediction")
+
+    # Model-Based CF
+    # read data for model-based CF
+    if 1 == 1:
+        # read user.json
+        user_data = []
+        with open(folder_path + "user.json") as in_file:
+            while True:
+                data = in_file.readlines(5000000)
+                if not data:
+                    break
+                user_RDD = sc.parallelize(data).map(lambda x: json.loads(x)).map(read_user).filter(lambda x: x[0] in uid_dict).map(map_user)
+                user_data += user_RDD.collect()
+        business_RDD = sc.textFile(folder_path+"business.json").map(lambda x: json.loads(x)).map(read_business).filter(lambda x: x[0] in bid_dict).map(
+            map_business)
+        business_data = business_RDD.collect()
+
+        # Preprocessing Data
+        user_frame = pd.DataFrame(user_data, columns=["user_id", "average_stars", "review_count", "fans_sqr", "friends_sqr", "yelping_since", "useful", "funny", "cool", "compliment_hot", "compliment_more", "compliment_profile", "compliment_cute", "compliment_list", "compliment_note", "compliment_plain", "compliment_cool", "compliment_funny", "compliment_writer", "compliment_photos"])
+        business_frame = pd.DataFrame(business_data, columns=["business_id", "stars", "review_count", "state", "categories", "city", "latitude", "longitude", "hours"])
+        # Get pca for compliment
+        compliment = np.array(user_frame.iloc[:, 9:])
+        print(compliment.shape)
+        pca = PCA(n_components=5, svd_solver='full')
+        compliment = pca.fit_transform(compliment)
+        print(compliment.shape)
+        compliment = np.transpose(compliment)
+        for i in range(len(compliment)):
+            user_frame["compliment_"+str(i)] = compliment[i]
+        user_frame = user_frame.drop(columns=["compliment_hot", "compliment_more", "compliment_profile", "compliment_cute", "compliment_list", "compliment_note", "compliment_plain", "compliment_cool", "compliment_funny", "compliment_writer", "compliment_photos"])
 
 
-start = time()
+        # dummies of city
+        city = pd.get_dummies(business_frame.city, prefix="city")
+        city = np.array(city)
+        
+        pca = PCA(n_components=10, svd_solver='full')
+        city = pca.fit_transform(city)
+        city = np.transpose(city)
+        for i in range(len(city)):
+            business_frame["city_"+str(i)] = city[i]
+        business_frame = business_frame.drop(columns=["city"])
 
-sc = SparkContext.getOrCreate()
+        # dummies of state
+        state = pd.get_dummies(business_frame.state, prefix="state")
+        state = state.drop(columns=[state.columns[-1]])
+        business_frame = pd.concat([business_frame, state], axis=1)
+        business_frame = business_frame.drop(columns=["state"])
 
-# folder_path = sys.argv[1]+'/'
-# user_feature_file = folder_path + 'user.json'
-# business_feature_file = folder_path + 'business.json'
-# train_file_name = folder_path + 'yelp_train.csv'
-# test_file_name = sys.argv[2]
-# output_file_name = sys.argv[3]
-import os
-cur_pwd = '/Users/ywang/vscode_workspace/usc_dsci_553/hw3'
-user_feature_file = os.path.join(cur_pwd, 'data', 'user.json')
-business_feature_file = os.path.join(cur_pwd, 'data', 'business.json')
-train_file_name = os.path.join(cur_pwd, 'data', 'yelp_train.csv')
-test_file_name = os.path.join(cur_pwd, 'data', 'yelp_val.csv')
-output_file_name = os.path.join(cur_pwd, 'task2_3_resource.json')
+        # dummies of categories
+        category_set = set()
+        for cc in business_frame.categories:
+            category_set = set(chain(category_set, cc))
+        category_matrix = []
+        for cc in category_set:
+            category_matrix.append(business_frame.categories.apply(lambda x: x.intersection(set([cc]))).apply(lambda x: 0 if x == set() else 1))
+        category_matrix = np.transpose(np.array(category_matrix))
+        pca = PCA(n_components=10, svd_solver='full')
+        category_matrix = pca.fit_transform(category_matrix)
+        category_matrix = np.transpose(category_matrix)
+        for i in range(len(category_matrix)):
+            business_frame["category_"+str(i)] = category_matrix[i]
+        business_frame = business_frame.drop(columns=["categories"])
+        
+        # dummies of hours
+        print(list(business_frame.hours)[0:5])
+        hours_set = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        hours_matrix = []
+        for hh in hours_set:
+            hours_matrix.append(business_frame.hours.apply(lambda x: x.intersection(set([hh]))).apply(lambda x: 0 if x == set() else 1))
+        for i in range(len(hours_matrix)):
+            business_frame["Day_"+str(i)] = hours_matrix[i]
+        business_frame = business_frame.drop(columns=["hours"])
+        print(list(business_frame.Day_1)[0:10])
 
 
-pre_train_data = sc.textFile(train_file_name).filter(lambda x: x != "user_id,business_id,stars").map(
-    lambda x: x.split(','))
-pre_test_data = sc.textFile(test_file_name).filter(lambda x: x != "user_id,business_id,stars").map(
-    lambda x: x.split(','))
+    print("Finished reading files for model-based CF")
+    # single model
+    user_frame_pred = user_frame.set_index("user_id")
+    business_frame_pred = business_frame.set_index("business_id")
+    X = []
+    for tt in train_RDD.collect():
+        X.append(get_matrix_train(tt, user_frame_pred, business_frame_pred))
+    X = np.array(X)
+    X_test = []
+    for tt in test_RDD.collect():
+        X_test.append(get_matrix_test(tt, user_frame_pred, business_frame_pred))
+    X_test = np.array(X_test)
+    Y = np.array(train_RDD.map(get_y).collect())
 
-mb_res = model_based(pre_train_data, pre_test_data, user_feature_file, business_feature_file)
-cf_res, test_X_neighbor_num = collaborative_filtering(pre_train_data, pre_test_data)
-max_neighbor_num = max(test_X_neighbor_num.values())
-cf_normalized = []
-mb_normalized = []
-for pair in cf_res:
-    cf_normalized.append((pair[0], float(test_X_neighbor_num[pair[0]] / max_neighbor_num) * pair[1]))
-for pair in mb_res:
-    mb_normalized.append((pair[0], (1 - float(test_X_neighbor_num[pair[0]] / max_neighbor_num)) * pair[1]))
-combined_res = mb_normalized + cf_normalized
-combined_rdd = sc.parallelize(combined_res).reduceByKey(lambda x, y: x + y)
+    print(X.shape)
+    print("Finished preparing X and Y")
 
-with open(output_file_name, 'w+') as output:
-    output.write('user_id,business_id,prediction\n')
-    for pair in combined_rdd.collect():
-        output.write(pair[0][0] + "," + pair[0][1] + "," + str(pair[1]) + "\n")
-    output.close()
+    duration = time.time() - start_time
+    print("Duration: "+str(duration))
 
-end = time()
-print(end - start)
+    # xgb model
+    import xgboost as xgb
+    from joblib import dump, load
+    xgb_model = xgb.XGBRegressor(verbosity=0, n_estimators=220, random_state=2, max_depth=7, learning_rate=0.05)
+    X_train, X_val, Y_train, Y_val = train_test_split(X, Y, random_state=2, test_size=0.05)
+    xgb_model.fit(X, Y, eval_metric='rmse', eval_set=[(X_val, Y_val)])
+
+    # make predictions
+    Y_pred = xgb_model.predict(X_test)
+    # write results
+    model_prediction = ""
+    rows = test_RDD.collect()
+    for i in range(len(rows)):
+        if Y_pred[i] < 1:
+            model_prediction += uid_dict_reversed[rows[i][1]] + "," + bid_dict_reversed[rows[i][0]] + "," + str(1) + "\n"
+        elif Y_pred[i] > 5:
+            model_prediction += uid_dict_reversed[rows[i][1]] + "," + bid_dict_reversed[rows[i][0]] + "," + str(5) + "\n"
+        else:
+            model_prediction += uid_dict_reversed[rows[i][1]] + "," + bid_dict_reversed[rows[i][0]] + "," + str(
+                Y_pred[i]) + "\n"
+
+    # final output
+    output = "user_id, business_id, stars\n"
+    output += model_prediction
+    # write file
+    with open(output_path, "w") as out_file:
+        out_file.writelines(output)
+    get_RMSE(test_path)
+    
+    duration = time.time() - start_time
+    print("Duration: "+str(duration))
